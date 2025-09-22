@@ -2,7 +2,7 @@
 FROM python:3.9-slim
 
 # Устанавливаем рабочую директорию в контейнере
-WORKDIR /solver
+WORKDIR /flask
 
 # Копируем файл с зависимостями
 COPY requirements.txt .
@@ -20,4 +20,4 @@ EXPOSE 5000
 # Команда для запуска приложения при старте контейнера
 # Запускаем Gunicorn с 2 воркерами, биндим на все IP-адреса на порту 5000
 # app:app означает: из файла app.py взять объект с именем app
-CMD ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:5000", "solver:solver"]
+CMD ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:5000", "flask:flask"]
