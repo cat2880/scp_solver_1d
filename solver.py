@@ -203,7 +203,6 @@ def generate_final_cutting_plan(result, original_demands, original_lengths, stoc
     demands_map = {i: qty for i, qty in enumerate(original_demands)}
     fulfilled_map = defaultdict(int)
     
-    # ИЗМЕНЕНИЕ: Рассчитываем остаток для каждого уникального паттерна
     patterns_with_waste = []
     for p_info in result['used_patterns']:
         pattern_vector = np.array(p_info['pattern'])
@@ -219,7 +218,6 @@ def generate_final_cutting_plan(result, original_demands, original_lengths, stoc
             'waste': waste_on_bar
         })
 
-    # ИЗМЕНЕНИЕ: Сортируем по возрастанию остатка (самые эффективные - первые)
     final_individual_layouts = []
     for p_info in sorted(patterns_with_waste, key=lambda p: p['waste']):
         for _ in range(p_info['count']):
@@ -260,12 +258,29 @@ def run_solver(input_data, stock_length, saw_kerf, timeout=300):
         for material, profiles in item.items():
             output[material] = {}
             for profile, pieces in profiles.items():
-                lengths = [p['length'] for p in pieces]
-                demands = [p['quantity'] for p in pieces]
+                lengths = np.array([p['length'] for p in pieces])
+                demands = np.array([p['quantity'] for p in pieces])
 
-                result = solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name=profile, timeout=timeout)
-                # Передаем доп. параметры для правильной сортировки
-                result = generate_final_cutting_plan(result, demands, lengths, stock_length, saw_kerf)
+                # --- НОВАЯ ЛОГИКА: ПРОВЕРКА "ЧЕЛОВЕЧЕСКОГО ФАКТОРА" ---
+                # Проверяем, помещается ли весь заказ на один хлыст
+                if np.sum(demands) > 0:
+                    total_demand_length = np.sum(demands * lengths) + np.sum(demands) * saw_kerf
+                else:
+                    total_demand_length = 0
+
+                if np.sum(demands) > 0 and total_demand_length <= stock_length:
+                    # Если да, это и есть оптимальное решение. Пропускаем сложный расчет.
+                    result = {
+                        'min_bars': 1,
+                        'min_unique_patterns': 1,
+                        'used_patterns': [{'pattern': demands.tolist(), 'count': 1}],
+                        'total_patterns_generated': 1,
+                        'comment': 'Optimal solution found by simple heuristic: all parts fit on one stock.'
+                    }
+                else:
+                    # Если не помещается, запускаем основной сложный алгоритм
+                    result = solve_csp_rich(lengths.tolist(), demands.tolist(), stock_length, saw_kerf, profile_name=profile, timeout=timeout)
+                    result = generate_final_cutting_plan(result, demands.tolist(), lengths.tolist(), stock_length, saw_kerf)
 
                 if 'used_patterns' in result and result['used_patterns']:
                     original_lengths_np = np.array(lengths)
