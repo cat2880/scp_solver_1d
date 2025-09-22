@@ -1,65 +1,46 @@
 # -*- coding: utf-8 -*-
+import time
 import numpy as np
 import math
 from scipy.optimize import linprog
-from numba import njit
 from collections import defaultdict
-
-# Попытка использовать pulp для MIP-частей
-try:
-    import pulp
-
-    HAS_PULP = True
-except ImportError:
-    HAS_PULP = False
+import json
+import pulp
+from numba import njit
 
 # --- КОНСТАНТЫ ---
 EPS = 1e-8
 MAX_PRICING_ITERS = 1000
-TIMEOUT_SECONDS = 300  # Максимальное время выполнения для каждого этапа решателя
-
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def safe_linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None, bounds=None, method='highs', integrality=None,
                  options=None):
-    """Безопасный вызов linprog с обработкой ошибок и совместимостью версий."""
     try:
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method=method,
                       integrality=integrality, options=options)
     except TypeError:
-        # Для старых версий scipy, которые не поддерживают integrality
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method=method, options=options)
     return res
 
 
 def extract_duals(res, n_rows):
-    """Извлекает двойственные переменные из результата linprog."""
-    try:
-        if hasattr(res, 'ineqlin') and getattr(res.ineqlin, 'marginals', None) is not None:
-            marg = np.array(res.ineqlin.marginals)
-            if len(marg) >= n_rows:
-                return -marg[:n_rows]
-    except Exception:
-        pass
-    try:
-        if isinstance(res, dict) and 'marginals' in res:
-            marg = np.array(res['marginals'])
-            if len(marg) >= n_rows:
-                return -marg[:n_rows]
-    except Exception:
-        pass
+    if hasattr(res, 'ineqlin') and getattr(res.ineqlin, 'marginals', None) is not None:
+        marg = np.array(res.ineqlin.marginals)
+        if len(marg) >= n_rows: return -marg[:n_rows]
+    if isinstance(res, dict) and 'marginals' in res:
+        marg = np.array(res['marginals'])
+        if len(marg) >= n_rows: return -marg[:n_rows]
     return None
 
+# --- Решатель задачи о рюкзаке (Numba) ---
 
 @njit
 def solve_pricing_numba(stock_length, lengths, duals, allowed_indices):
-    """Решает задачу о рюкзаке для генерации нового шаблона (скомпилировано с Numba)."""
     n = len(lengths)
     dp = np.full(stock_length + 1, -1e18)
     dp[0] = 0.0
     choice = np.full(stock_length + 1, -1, dtype=np.int32)
-
     for cap in range(1, stock_length + 1):
         best_val = -1e18
         best_choice = -1
@@ -72,44 +53,34 @@ def solve_pricing_numba(stock_length, lengths, duals, allowed_indices):
                     best_choice = i
         dp[cap] = best_val
         choice[cap] = best_choice
-
     max_value = -1e18
     cap_max = -1
     for cap in range(stock_length + 1):
         if dp[cap] > max_value:
             max_value = dp[cap]
             cap_max = cap
-
-    if not np.isfinite(max_value):
-        return None, None
-
+    if not np.isfinite(max_value): return None, None
     reduced_cost = 1.0 - max_value
-    if reduced_cost >= -EPS:
-        return None, None
-
+    if reduced_cost >= -EPS: return None, None
     pattern = np.zeros(n, dtype=np.float64)
     curr_cap = cap_max
     while curr_cap > 0:
         item_idx = choice[curr_cap]
-        if item_idx == -1:
-            break
+        if item_idx == -1: break
         pattern[item_idx] += 1
         curr_cap -= int(lengths[item_idx])
-
     return pattern, reduced_cost
 
-
 def solve_pricing(stock_length, lengths, duals, allowed_indices=None):
-    """Обертка для вызова решателя задачи о рюкзаке."""
     if allowed_indices is None:
         allowed_indices = np.arange(len(lengths), dtype=np.int32)
     else:
         allowed_indices = np.array(allowed_indices, dtype=np.int32)
     return solve_pricing_numba(stock_length, lengths, duals, allowed_indices)
 
+# --- (остальной код остается без изменений) ---
 
 def generate_initial_patterns(lengths, stock_length, max_combo=3):
-    """Генерирует начальный набор шаблонов раскроя."""
     n = len(lengths)
     patterns = []
     from itertools import combinations
@@ -137,9 +108,7 @@ def generate_initial_patterns(lengths, stock_length, max_combo=3):
     return [A_unique[:, i] for i in range(A_unique.shape[1])]
 
 
-def solve_integer_min_bars_with_pulp(A, demands):
-    """Решает целочисленную задачу минимизации количества хлыстов с помощью PuLP."""
-    if not HAS_PULP: return False, None, None
+def solve_integer_min_bars_with_pulp(A, demands, timeout):
     m = A.shape[1]
     n = A.shape[0]
     prob = pulp.LpProblem('min_bars', pulp.LpMinimize)
@@ -147,16 +116,14 @@ def solve_integer_min_bars_with_pulp(A, demands):
     prob += pulp.lpSum(x)
     for i in range(n):
         prob += pulp.lpSum(A[i, j] * x[j] for j in range(m)) >= demands[i]
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=TIMEOUT_SECONDS))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=timeout))
     if pulp.LpStatus[prob.status] != 'Optimal': return False, None, None
     x_vals = np.array([pulp.value(xj) for xj in x], dtype=float)
     obj = float(sum(x_vals))
     return True, x_vals, obj
 
 
-def minimize_unique_patterns_with_pulp(A, demands, K):
-    """Решает задачу минимизации количества уникальных шаблонов с помощью PuLP."""
-    if not HAS_PULP: return False, None, None
+def minimize_unique_patterns_with_pulp(A, demands, K, timeout):
     m = A.shape[1]
     n = A.shape[0]
     M = int(sum(demands))
@@ -168,14 +135,13 @@ def minimize_unique_patterns_with_pulp(A, demands, K):
         prob += pulp.lpSum(A[i, j] * x[j] for j in range(m)) >= demands[i]
     prob += pulp.lpSum(x) == int(K)
     for j in range(m): prob += x[j] <= M * y[j]
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=TIMEOUT_SECONDS))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=timeout))
     if pulp.LpStatus[prob.status] != 'Optimal': return False, None, None
     x_vals = np.array([pulp.value(xj) for xj in x], dtype=float)
     return True, x_vals, None
 
 
-def solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name='Unknown'):
-    """Основная функция решения задачи для одного профиля."""
+def solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name='Unknown', timeout=300):
     lengths_with_kerf = np.array(lengths, dtype=float) + saw_kerf
     demands_np = np.array(demands, dtype=float)
     n = len(lengths)
@@ -194,29 +160,33 @@ def solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name='Unkno
     res_lp = None
     for it in range(MAX_PRICING_ITERS):
         res = safe_linprog(c, A_ub=-A, b_ub=-demands_np, bounds=(0, None), method='highs',
-                           options={'timeout': TIMEOUT_SECONDS})
+                           options={'timeout': timeout})
         if not res.success: break
         res_lp = res
         duals = extract_duals(res, n_rows=n)
         if duals is None: break
-        pricing = solve_pricing(stock_length, lengths_with_kerf, duals)
-        if pricing is None or pricing[0] is None: break
-        new_pat, reduced = pricing
+        pricing, _ = solve_pricing(stock_length, lengths_with_kerf, duals)
+        if pricing is None: break
+        new_pat = pricing
         if np.any(np.all(np.isclose(A, new_pat.reshape(-1, 1)), axis=0)): break
         A = np.hstack((A, new_pat.reshape(-1, 1)))
         c = np.append(c, 1.0)
 
     K_lb = int(math.ceil(res_lp.fun - EPS)) if res_lp and res_lp.success else None
-    ok_int, x_int, obj_int = solve_integer_min_bars_with_pulp(A, demands_np)
+    
+    ok_int, x_int, obj_int = solve_integer_min_bars_with_pulp(A, demands_np, timeout)
     best_K = int(math.ceil(obj_int - EPS)) if ok_int else K_lb
 
     used_patterns = []
-    if best_K is not None and HAS_PULP:
-        ok_min, x_vals, _ = minimize_unique_patterns_with_pulp(A, demands_np, best_K)
-        if ok_min:
+    if best_K is not None:
+        ok_min, x_vals, _ = minimize_unique_patterns_with_pulp(A, demands_np, best_K, timeout)
+        
+        if not ok_min and ok_int:
             for j in range(A.shape[1]):
-                if x_vals[j] > 0.5:
-                    used_patterns.append({'pattern': A[:, j].tolist(), 'count': int(round(x_vals[j]))})
+                if x_int[j] > 0.5: used_patterns.append({'pattern': A[:, j].tolist(), 'count': int(round(x_int[j]))})
+        elif ok_min:
+            for j in range(A.shape[1]):
+                if x_vals[j] > 0.5: used_patterns.append({'pattern': A[:, j].tolist(), 'count': int(round(x_vals[j]))})
 
     return {
         'min_bars': best_K,
@@ -226,16 +196,30 @@ def solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name='Unkno
     }
 
 
-def generate_final_cutting_plan(result, original_demands_list):
-    """Создает финальный план раскроя, отрезая только необходимые детали."""
+def generate_final_cutting_plan(result, original_demands, original_lengths, stock_length, saw_kerf):
     if 'used_patterns' not in result or not result['used_patterns']:
         return result
 
-    demands_map = {i: qty for i, qty in enumerate(original_demands_list)}
+    demands_map = {i: qty for i, qty in enumerate(original_demands)}
     fulfilled_map = defaultdict(int)
-    final_individual_layouts = []
+    
+    patterns_with_waste = []
+    for p_info in result['used_patterns']:
+        pattern_vector = np.array(p_info['pattern'])
+        num_cuts = np.sum(pattern_vector)
+        length_of_pieces = np.sum(pattern_vector * np.array(original_lengths))
+        length_of_kerfs = num_cuts * saw_kerf if num_cuts > 0 else 0
+        total_length_used_on_bar = length_of_pieces + length_of_kerfs
+        waste_on_bar = stock_length - total_length_used_on_bar
+        
+        patterns_with_waste.append({
+            'pattern': p_info['pattern'],
+            'count': p_info['count'],
+            'waste': waste_on_bar
+        })
 
-    for p_info in sorted(result['used_patterns'], key=lambda p: -np.sum(p['pattern'])):
+    final_individual_layouts = []
+    for p_info in sorted(patterns_with_waste, key=lambda p: p['waste']):
         for _ in range(p_info['count']):
             final_individual_layouts.append(p_info['pattern'])
 
@@ -268,10 +252,7 @@ def generate_final_cutting_plan(result, original_demands_list):
     return new_result
 
 
-def run_solver(input_data, stock_length, saw_kerf):
-    """
-    Главная функция, которая запускает процесс расчета для всех материалов и профилей.
-    """
+def run_solver(input_data, stock_length, saw_kerf, timeout=300):
     output = {}
     for item in input_data:
         for material, profiles in item.items():
@@ -280,8 +261,8 @@ def run_solver(input_data, stock_length, saw_kerf):
                 lengths = [p['length'] for p in pieces]
                 demands = [p['quantity'] for p in pieces]
 
-                result = solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name=profile)
-                result = generate_final_cutting_plan(result, demands)
+                result = solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name=profile, timeout=timeout)
+                result = generate_final_cutting_plan(result, demands, lengths, stock_length, saw_kerf)
 
                 if 'used_patterns' in result and result['used_patterns']:
                     original_lengths_np = np.array(lengths)
@@ -312,3 +293,4 @@ def run_solver(input_data, stock_length, saw_kerf):
 
                 output[material][profile] = result
     return output
+
