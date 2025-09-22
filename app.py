@@ -36,4 +36,6 @@ def solve_endpoint():
 
 if __name__ == '__main__':
     # Запуск сервера для локального тестирования
+    # В production-среде используйте Gunicorn или другой WSGI сервер
     app.run(host='0.0.0.0', port=8080, debug=True)
+
