@@ -203,6 +203,7 @@ def generate_final_cutting_plan(result, original_demands, original_lengths, stoc
     demands_map = {i: qty for i, qty in enumerate(original_demands)}
     fulfilled_map = defaultdict(int)
     
+    # ИЗМЕНЕНИЕ: Рассчитываем остаток для каждого уникального паттерна
     patterns_with_waste = []
     for p_info in result['used_patterns']:
         pattern_vector = np.array(p_info['pattern'])
@@ -218,6 +219,7 @@ def generate_final_cutting_plan(result, original_demands, original_lengths, stoc
             'waste': waste_on_bar
         })
 
+    # ИЗМЕНЕНИЕ: Сортируем по возрастанию остатка (самые эффективные - первые)
     final_individual_layouts = []
     for p_info in sorted(patterns_with_waste, key=lambda p: p['waste']):
         for _ in range(p_info['count']):
@@ -262,6 +264,7 @@ def run_solver(input_data, stock_length, saw_kerf, timeout=300):
                 demands = [p['quantity'] for p in pieces]
 
                 result = solve_csp_rich(lengths, demands, stock_length, saw_kerf, profile_name=profile, timeout=timeout)
+                # Передаем доп. параметры для правильной сортировки
                 result = generate_final_cutting_plan(result, demands, lengths, stock_length, saw_kerf)
 
                 if 'used_patterns' in result and result['used_patterns']:
