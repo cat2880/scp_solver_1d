@@ -1,0 +1,6 @@
+Flask==3.0.3
+gunicorn==22.0.0
+numpy==1.26.4
+scipy==1.13.1
+numba==0.59.1
+pulp==2.8.0
